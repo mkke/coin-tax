@@ -1,0 +1,11 @@
+# coin-tax configuration file, usually read from ~/.coin-tax
+[BitcoinTaxes]
+api=https://api.bitcoin.tax/v1
+api_key=123
+api_secret=456
+db=dbi:SQLite:dbname=~/.BitcoinTaxes.db
+
+[Coinlib-Historical]
+# Powered by Coinlib API https://coinlib.io/apidocs
+api=
+

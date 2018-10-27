@@ -1,32 +1,42 @@
 #!/usr/bin/perl -w
 use strict;
 use JSON;
-use POSIX qw(strftime);
+use POSIX qw(strftime mktime);
 use Carp;
 use LWP::Simple;
 use Time::HiRes qw(usleep time);
+use Getopt::Long;
 
 use constant ATOMS_PER_DECRED => 10**8;
+
+my $exportYear = -1; # 0 = all
+my $addToAccounting = 0;
+my $accountingCmd = "../bitcoin-taxes";
+my $accountingCurrency = "EUR";
+GetOptions("year=i" => \$exportYear, "add-to-accounting" => \$addToAccounting, "accounting-cmd=s" => \$accountingCmd);
 
 my $transactions = parse_json("dcrctl --wallet listtransactions '*' 1000 0 1");
 my $balances = parse_json("dcrctl --wallet getbalance");
 my %own_address = map { $_ => 1 } @{parse_json("dcrctl --wallet getaddressesbyaccount default")};
 my %seen_txid = map { $_->{txid} => 1 } @$transactions;
+my %expTicket = ();
+my @accounting = ();
 
-printf("%-19s  %-10s  %-10s  %12s  %12s  %12s  %12s  %12s\n", "Block time", "Category", "TxType", "Amount", "Fee", "PoS reward", "Net reward", "Balance"); 
-print "-" x 113 . "\n";
+printf("%-19s  %-10s  %-10s  %13s  %12s  %12s  %12s  %12s\n", "Block time", "Category", "TxType", "Amount", "Fee", "PoS reward", "Net reward", "Balance"); 
+print "-" x 114 . "\n";
 my $sum = 0;
 my $balance = 0;
 my $prevyear = -1;
+my $prev_t = undef;
 my $open_ticketfees = 0;
 my %open_tickets = ();
 foreach my $t (@$transactions) {
   my $year = (gmtime($t->{blocktime}))[5] + 1900;
   if ($year != $prevyear) {
     if ($prevyear >= 0) {
-      print "-" x 113 . "\n";
-      printf("%-86s %12.8f  %12.8f\n", "Total " . $prevyear, $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
-      print "-" x 113 . "\n";
+      print "-" x 114 . "\n";
+      printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . sprintf(" (rate of return %0.1f%%)", $sum * 100 / ($balance - $sum)), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
+      print "-" x 114 . "\n";
     }
     $prevyear = $year;
     $sum = 0;
@@ -51,7 +61,7 @@ foreach my $t (@$transactions) {
 
     $open_ticketfees += $ticket_fees + $consolidating_tx_fees;
     $open_tickets{$t->{txid}} = { ticket_tx => $ticket_tx, ticket_fees => $ticket_fees, consolidating_tx_fees => $consolidating_tx_fees };
-    printf("%19s  %-10s  %-10s  %12.8f  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee}, "-", "-", '...');
+    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee}, "-", "-", '...');
   } elsif ($t->{txtype} eq "vote" && $t->{amount} != 0) {
     my $tx = get_rawtx($t->{blockhash}, $t->{txid});
 
@@ -117,22 +127,91 @@ foreach my $t (@$transactions) {
     my $net_reward = $voutOwn - $vinTicket - $ticket->{ticket_fees} - $ticket->{consolidating_tx_fees};
     $sum += $net_reward * ATOMS_PER_DECRED;
     $balance += $net_reward * ATOMS_PER_DECRED;
-    printf("%19s  %-10s  %-10s  %12.8f  %12.8f  %12.8f  %12.8f  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $voutSum, -$voutStakepool, $pos_reward, $net_reward, $balance / ATOMS_PER_DECRED);
+    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12.8f  %12.8f  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $voutSum, -$voutStakepool, $pos_reward, $net_reward, $balance / ATOMS_PER_DECRED);
+
+    my $expYear = (gmtime($t->{blocktime}))[5] + 1900;
+    if (!exists $expTicket{$expYear}) {
+      $expTicket{$expYear} = [];
+    }
+    my $memo = sprintf("Tkt %s fee %.8f cons %.8f", substr($ticket_txid, 0, 8), $ticket->{ticket_fees}, $ticket->{consolidating_tx_fees});
+    die "max. memo length 45 exceeded: '$memo'" if length($memo) > 45;
+    push(@{$expTicket{$expYear}}, {
+      "Date" => strftime("%F %T", gmtime($t->{blocktime})) . "Z",
+      "Action" => "INCOME",
+      "Memo" => $memo,
+      "Source" => "DCR Ticket Vote",
+      "Symbol" => "DCR",
+      "Volume" => sprintf("%.8f", $net_reward)
+    });
+    if ($addToAccounting and $year == 2018) {
+      push(@accounting, {
+        "date" => strftime("%F %T", gmtime($t->{blocktime})) . "Z",
+        "action" => "INCOME",
+        "memo" => $memo,
+        "exchange" => "DCR Ticket Vote",
+        "exchangeid" => $ticket_txid,
+        "symbol" => "DCR",
+        "volume" => sprintf("%.8f", $net_reward),
+        "txhash" => $ticket_txid,
+        "currency" => $accountingCurrency
+      });
+    }
   } elsif ($t->{txtype} eq "regular") {
     $balance += $t->{amount} * ATOMS_PER_DECRED;
-    printf("%19s  %-10s  %-10s  %12.8f  %12.8f  %12s  %12s  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee} || 0, "-", "-", $balance / ATOMS_PER_DECRED);
+    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee} || 0, "-", "-", $balance / ATOMS_PER_DECRED);
   }
+  $prev_t = $t;
 }
-print "-" x 113 . "\n";
+print "-" x 114 . "\n";
 if ($open_ticketfees != 0) {
-  printf("%-86s %12.8f  %12.8f\n", "fees payed for live/immature tickets", -$open_ticketfees, -$open_ticketfees);
+  printf("%-87s %12.8f  %12.8f\n", "fees payed for live/immature tickets", -$open_ticketfees, -$open_ticketfees);
   $sum -= $open_ticketfees * ATOMS_PER_DECRED;
   $balance -= $open_ticketfees * ATOMS_PER_DECRED;
 }
-printf("%-86s %12.8f  %12.8f\n", "Total " . $prevyear, $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
-print "=" x 113 . "\n";
+my $start_of_year = mktime(0,0,0,1,0,$prevyear-1900);
+my $end_of_year = mktime(0,0,0,1,0,$prevyear+1-1900);
+my $ror = ($sum * 100 / ($balance - $sum)) * ($end_of_year - $start_of_year) / ($prev_t->{blocktime} - $start_of_year);
+printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . " .. " . strftime("%F", gmtime($prev_t->{blocktime})) . sprintf(" (rate of return annual. %0.1f%%)", $ror), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
+print "=" x 114 . "\n";
 
-printf("%-99s  %12.8f\n", "Balance", $balances->{cumulativetotal});
+printf("%-100s  %12.8f\n", "Balance", $balances->{cumulativetotal});
+
+if ($exportYear >= 0) {
+  my @exportYears = ();
+  if ($exportYear > 0) {
+    if (!exists $expTicket{$exportYear}) {
+      print("no ticket votes in year $exportYear\n");
+    } else {
+      push @exportYears, $exportYear;
+    }
+  } else {
+    @exportYears = keys %expTicket;
+  }
+  foreach my $year (@exportYears) {
+    my @expYear = @{$expTicket{$year}};
+    my @expFields = sort keys %{$expYear[0]};
+    my $filename = "decred_ticket_export_bitcointax_$year.csv";
+    open my $export, ">$filename" or die;
+    print $export join(",", @expFields) . "\n";
+    foreach my $line (@expYear) {
+      print $export join(",", map { $line->{$_} } @expFields) . "\n";
+    }
+    close $export;
+    print "year $year exported to $filename\n";
+  }
+}
+
+if (scalar @accounting) {
+  foreach my $t (reverse @accounting) {
+    my $code = system($accountingCmd, map { "--$_=$t->{$_}" } keys %$t);
+    if ($code == 2) {
+      last;
+    } elsif ($code != 0) {
+      exit 1;
+    }
+    exit 0;
+  }
+}
 exit 0; 
 
 # compare against mainnet.decred.org
@@ -254,7 +333,7 @@ sub traverse_unseen_own_txid_fees {
     }
     if ($is_consolidating) {
       $consolidating_tx_fees += $funding_tx_fees;
-      printf("%19s  %-11s %-10s  %12s  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($funding_tx->{blocktime})), "consolidate", "ticket", "-", -$funding_tx_fees, "-", "-", '...');
+      printf("%19s  %-11s %-10s  %13s  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($funding_tx->{blocktime})), "consolidate", "ticket", "-", -$funding_tx_fees, "-", "-", '...');
     }
     $seen_txid{$txid} = 1;
   }

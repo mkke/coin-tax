@@ -1,0 +1,258 @@
+#!/usr/bin/perl -w
+use strict;
+use Config::Tiny;
+use Getopt::Long;
+use DBI;
+use LWP::UserAgent;
+use URI;
+use JSON::PP;
+use Math::BigFloat;
+use Date::Manip::Date;
+
+my @actions = qw(BUY FEE GIFTIN INCOME LOST MINING SELL SPEND STOLEN);
+my %valid_action = map { $_ => 1 } @actions;
+
+my $startYear = (gmtime)[5] + 1900;
+my $endYear = $startYear;
+my $update = 0;
+my $add = 0;
+my ($action, $date, $volume, $symbol, $price, $total, $currency, $exchange,
+    $exchangeid, $fee, $feecurrency, $memo, $txhash, $sender, $recipient);
+my $quiet = 0;
+GetOptions("update" => \$update, "year=i" => \$startYear, "end-year=i" => \$endYear,
+           "action=s" => \$action, "date=s" => \$date, "volume=s" => \$volume,
+           "symbol=s" => \$symbol, "price=s" => \$price, "total=s" => \$total,
+           "currency=s" => \$currency, "exchange=s" => \$exchange, "exchangeid=s" => \$exchangeid,
+           "fee=s" => \$fee, "feecurrency=s" => \$feecurrency, "memo=s" => \$memo,
+           "txhash=s" => \$txhash, "sender=s" => \$sender, "recipient=s" => \$recipient,
+           "quiet" => \$quiet);
+if (defined($action)) {
+  if (!exists $valid_action{$action}) {
+    print "'$action' is not a supported action\n";
+    exit 1;
+  }
+
+  if (!defined $date) {
+    print "Option date must be specified\n";
+    exit 1;
+  } else {
+    my $dmd = new Date::Manip::Date;
+    $dmd->config("setdate","now,UTC");
+    if ($dmd->parse($date)) {
+      print("'$date' is no valid date: " . ($dmd->err) . "\n");
+      exit 1;
+    }
+    $date = $dmd;
+  }
+  if (!defined $symbol) {
+    print "Option symbol must be specified\n";
+    exit 1;
+  }
+  if (!defined $currency) {
+    print "Option currency must be specified\n";
+    exit 1;
+  }
+
+  $volume = as_big_float($volume, "volume", 1);
+  $price = as_big_float($price, "price");
+  $total = as_big_float($total, "total");
+  $fee = as_big_float($fee, "fee");
+
+  if (!defined $price && !defined $total) {
+    print("Exactly one of the options price, total must be specified\n");
+    exit 1;
+  } elsif (defined $price && defined $total) {
+    print("Only one of the options price, total must be specified\n");
+    exit 1;
+  }
+
+  $add = 1;
+}
+if (!$update && !$add) {
+  print("Usage: bitcoin-taxes --update [ --year=<start year> ] [ --end-year=<end year ]\n"); 
+  print("       bitcoin-taxes --action={BUY|FEE|GIFTIN|INCOME|LOST|MINING|SELL|SPEND|STOLEN}\n"); 
+  print("                     --date=<date>\n");
+  print("                     --volume=<volume> --symbol=<crypto-symbol>\n"); 
+  print("                     { --price=<price> | --total=<total> } --currency=<ISO 4217 currency>\n"); 
+  print("                     [ --exchange=<name> ] [ --exchangeid=<id> ]\n"); 
+  print("                     [ --fee=<fee> --feecurrency=<ISO 4217 currency> ]\n"); 
+  print("                     [ --memo=<memo text> ] [ --txhash=<hash> ]\n"); 
+  print("                     [ --sender=<coin address> ] [ --recipient=<coin address> ]\n"); 
+}
+
+sub as_big_float {
+  my $value = shift;
+  my $label = shift;
+  my $required = shift || 0;
+
+  if (!defined $value or $value eq "") {
+    if ($required) {
+      print("Option $label must be specified\n");
+      exit 1;
+    } else {
+      return undef;
+    }
+  }
+
+  my $bf = Math::BigFloat->new($value);
+  if ($bf->is_nan) {
+    print("'$value' is no valid value for option $label\n");
+    exit 1;
+  }
+
+  return $bf;
+}
+
+
+my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
+my $dbname = $config->{BitcoinTaxes}->{db} or exit_error("db not configured");
+$dbname =~ s/~/$ENV{HOME}/;
+
+my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
+# numeric values are stored as TEXT to not loose precision
+$dbh->do("CREATE TABLE IF NOT EXISTS transactions (id TEXT PRIMARY KEY, date DATETIME, action TEXT, exchange TEXT, exchangeid TEXT, symbol TEXT, currency TEXT, volume TEXT, price TEXT, total TEXT, fee TEXT, feecurrency TEXT, memo TEXT, txhash TEXT, sender TEXT, recipient TEXT)") or exit_error("create table transactions failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS transactions_date ON transactions(date)") or exit_error("create index transactions_date failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS transactions_txhash ON transactions(txhash)") or exit_error("create index transactions_txhash failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS transactions_exchange ON transactions(exchange, exchangeid)") or exit_error("create index transactions_exchange failed");
+
+my $select_id = $dbh->prepare("SELECT * FROM transactions WHERE id = ?") or exit_error("select_id prepare failed: $!");
+my $select_date = $dbh->prepare("SELECT * FROM transactions WHERE date = ?") or exit_error("select_date prepare failed: $!");
+my $select_txhash = $dbh->prepare("SELECT * FROM transactions WHERE lower(txhash) = lower(?)") or exit_error("select_txhash prepare failed: $!");
+my $select_exchange = $dbh->prepare("SELECT * FROM transactions WHERE lower(exchange) = lower(?) and lower(exchangeid) = lower(?)") or exit_error("select_exchange prepare failed: $!");
+my $insert_transaction = $dbh->prepare("INSERT OR REPLACE INTO transactions (id, date, action, exchange, exchangeid, symbol, currency, volume, price, total, fee, feecurrency, memo, txhash, sender, recipient) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_transaction prepare failed");
+
+my $json = JSON::PP->new->utf8->allow_blessed->allow_bignum->pretty;
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("bitcoin-taxes cli/1.0");
+my $api = URI->new($config->{BitcoinTaxes}->{api}) or exit_error("api url not configured");
+if ($add) {
+  my $url = URI->new($api . "/transactions");
+
+  my %new_transaction = ( "date" => $date->printf("%O%z"), "action" => $action,
+                          "symbol" => $symbol, "volume" => $volume );
+  if ($currency) {
+    $new_transaction{"currency"} = $currency;
+  }
+  if ($exchange) {
+    $new_transaction{"exchange"} = $exchange;
+  }
+  if ($exchangeid) {
+    if ($exchange) {
+      $select_exchange->execute($exchange, $exchangeid) or exit_error("select_exchange failed");
+      my $row;
+      if (defined($row = $select_exchange->fetchrow_hashref)) {
+        if (!$quiet) {
+          print "transaction with same (exchange, exchangeid) already recorded:\n" . $json->encode($row);
+        }
+        exit 2;
+      }
+    }
+    $new_transaction{"exchangeid"} = $exchangeid;
+  }
+  if ($price) {
+    $new_transaction{"price"} = $price;
+  }
+  if ($total) {
+    $new_transaction{"total"} = $total;
+  }
+  if ($fee) {
+    $new_transaction{"fee"} = $fee;
+  }
+  if ($feecurrency) {
+    $new_transaction{"feecurrency"} = $feecurrency;
+  }
+  if ($memo) {
+    if (length($memo) > 45) {
+      exit_error("memo maximum length (45 characters) exceeded");
+    }
+    $new_transaction{"memo"} = $memo;
+  }
+  if ($txhash) {
+    $select_txhash->execute($txhash) or exit_error("select_txhash failed");
+    my $row;
+    if (defined($row = $select_txhash->fetchrow_hashref)) {
+      if (!$quiet) {
+        print "transaction with same txhash already recorded:\n" . $json->encode($row);
+      }
+      exit 2;
+    }
+    $new_transaction{"txhash"} = $txhash;
+  }
+  if ($sender) {
+    $new_transaction{"sender"} = $sender;
+  }
+  if ($recipient) {
+    $new_transaction{"recipient"} = $recipient;
+  }
+
+  my $post_body = $json->encode(\%new_transaction);
+
+  my $res = $ua->post($url, "X-APIKEY" => $config->{BitcoinTaxes}->{api_key},
+                            "X-APISECRET" => $config->{BitcoinTaxes}->{api_secret},
+                            "Content-Type" => 'application/json; charset=UTF-8',
+                            "Content" => $post_body);
+
+  if (!$res->is_success) {
+    print $res->content;
+    exit_error $res->status_line;
+  }
+
+  my $json = $json->decode($res->decoded_content);
+  if ($json->{status} ne "success") {
+    print "request body:\n$post_body\n\nresponse body:\n" . $res->content . "\n"; 
+    exit_error("response status: $json->{status}");
+  }
+  #exit 0;
+  $update = 1;
+}
+if ($update) {
+  foreach my $taxYear($startYear..$endYear) {
+    my $url = URI->new($api . "/transactions");
+    my %params = ("limit" => "999999");
+    if ($taxYear >= 0) {
+      $params{"taxyear"} = $taxYear; 
+    }
+    $url->query_form(%params);
+    if (!$quiet) {
+      print "requesting $url\n";
+    }
+    my $res = $ua->get($url, "X-APIKEY" => $config->{BitcoinTaxes}->{api_key},
+                             "X-APISECRET" => $config->{BitcoinTaxes}->{api_secret});
+
+    if (!$res->is_success) {
+      print $res->content;
+      exit_error($res->status_line);
+    }
+
+    my $json = $json->decode($res->decoded_content);
+    if ($json->{status} ne "success") {
+      exit_error("response status: $json->{status}");
+    }
+
+    my @transactions = @{$json->{data}->{transactions}};
+    foreach my $t (@transactions) {
+      $insert_transaction->execute($t->{id}, $t->{date}, $t->{action},
+        $t->{exchange}, $t->{exchangeid}, $t->{symbol}, $t->{currency},
+        from_big_float($t->{volume}), from_big_float($t->{price}), from_big_float($t->{total}),
+        from_big_float($t->{fee}), $t->{feecurrency}, $t->{memo},
+        $t->{txhash}, $t->{sender}, $t->{recipient}) or exit_error("insert_transaction failed: $!");
+    }
+  }
+}
+exit 0;
+
+sub from_big_float {
+  my $value = shift;
+  if (defined $value) {
+    return $value->bdstr;
+  } else {
+    return undef;
+  }
+}
+
+sub exit_error {
+  my $message = shift;
+  print("$message\n");
+  exit 1;
+}
