@@ -20,14 +20,15 @@ my @currencies = split(/,/, $config->{Coinlib}->{currencies}) or exit_error("cur
 
 my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
 # numeric values are stored as TEXT to not loose precision
-$dbh->do("CREATE TABLE IF NOT EXISTS coins (symbol TEXT, date DATETIME, show_symbol TEXT, name TEXT, rank INTEGER, price TEXT, market_cap TEXT, total_volume_24h TEXT, low_24h TEXT, high_24h TEXT, delta_1h TEXT, delta_24h TEXT, delta_7d TEXT, delta_30d TEXT, PRIMARY KEY (symbol, date))") or exit_error("create table coins failed");
-$dbh->do("CREATE TABLE IF NOT EXISTS markets (coin_symbol TEXT, date DATETIME, symbol TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, date, symbol), FOREIGN KEY (coin_symbol, date) REFERENCES coins(symbol, date))") or exit_error("create table markets failed");
-$dbh->do("CREATE TABLE IF NOT EXISTS exchanges (coin_symbol TEXT, date DATETIME, symbol TEXT, name TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, date, symbol, name), FOREIGN KEY (coin_symbol, date, symbol) REFERENCES markets(coin_symbol, date, symbol))") or exit_error("create table exchanges failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS coins (symbol TEXT, currency TEXT, date DATETIME, show_symbol TEXT, name TEXT, rank INTEGER, price TEXT, market_cap TEXT, total_volume_24h TEXT, low_24h TEXT, high_24h TEXT, delta_1h TEXT, delta_24h TEXT, delta_7d TEXT, delta_30d TEXT, PRIMARY KEY (symbol, currency, date))") or exit_error("create table coins failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS markets (coin_symbol TEXT, currency TEXT, date DATETIME, symbol TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, currency, date, symbol), FOREIGN KEY (coin_symbol, currency, date) REFERENCES coins(symbol, currency, date))") or exit_error("create table markets failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS exchanges (coin_symbol TEXT, currency TEXT, date DATETIME, symbol TEXT, name TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, date, symbol, name), FOREIGN KEY (coin_symbol, currency, date, symbol) REFERENCES markets(coin_symbol, currency, date, symbol))") or exit_error("create table exchanges failed");
 $dbh->do("CREATE TABLE IF NOT EXISTS remaining (endpoint TEXT PRIMARY KEY, date DATETIME, remaining INTEGER)") or exit_error("create table remaining failed");
+$dbh->do("CREATE VIEW IF NOT EXISTS coin_prices(symbol, currency, date, show_symbol, name, rank, price, market_cap, total_volume_24h, low_24h, high_24h, delta_1h, delta_24h, delta_7d, delta_30d, market_symbol, market_volume_24h, market_price_24h, exchange, exchange_volume_24h, exchange_price) AS SELECT coins.*, markets.symbol AS market_symbol, markets.volume_24h AS market_volume_24h, markets.price AS market_price_24h, exchanges.name AS exchange, exchanges.volume_24h AS exchange_volume_24h, exchanges.price AS exchange_price FROM coins JOIN markets ON coins.symbol = markets.coin_symbol AND coins.currency = markets.currency AND coins.date = markets.date JOIN exchanges ON markets.coin_symbol = exchanges.coin_symbol AND markets.currency = exchanges.currency AND markets.date = exchanges.date AND markets.symbol = exchanges.symbol;");
 
-my $insert_coin = $dbh->prepare("INSERT OR REPLACE INTO coins (symbol, date, show_symbol, name, rank, price, market_cap, total_volume_24h, low_24h, high_24h, delta_1h, delta_24h, delta_7d, delta_30d) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_coin prepare failed");
-my $insert_market = $dbh->prepare("INSERT OR REPLACE INTO markets (coin_symbol, date, symbol, volume_24h, price) VALUES (?, ?, ?, ?, ?)") or exit_error("insert_market prepare failed");
-my $insert_exchange = $dbh->prepare("INSERT OR REPLACE INTO exchanges (coin_symbol, date, symbol, name, volume_24h, price) VALUES (?, ?, ?, ?, ?, ?)") or exit_error("insert_exchange prepare failed");
+my $insert_coin = $dbh->prepare("INSERT OR REPLACE INTO coins (symbol, currency, date, show_symbol, name, rank, price, market_cap, total_volume_24h, low_24h, high_24h, delta_1h, delta_24h, delta_7d, delta_30d) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_coin prepare failed");
+my $insert_market = $dbh->prepare("INSERT OR REPLACE INTO markets (coin_symbol, currency, date, symbol, volume_24h, price) VALUES (?, ?, ?, ?, ?, ?)") or exit_error("insert_market prepare failed");
+my $insert_exchange = $dbh->prepare("INSERT OR REPLACE INTO exchanges (coin_symbol, currency, date, symbol, name, volume_24h, price) VALUES (?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_exchange prepare failed");
 my $insert_remaining = $dbh->prepare("INSERT OR REPLACE INTO remaining (endpoint, date, remaining) VALUES (?, ?, ?)") or exit_error("insert_remaining prepare failed");
 my $select_remaining = $dbh->prepare("SELECT * FROM remaining WHERE endpoint = ?") or exit_error("select_remaining prepare failed");
 
@@ -98,7 +99,9 @@ foreach my $currency (@currencies) {
 
     foreach my $coin (@{$json_cl->{coins}}) {
       my $date = Date::Manip::Date->new("epoch ".$coin->{last_updated_timestamp})->printf("%O%z");
-      $insert_coin->execute($coin->{symbol}, $date, $coin->{show_symbol}, 
+      $date =~ s/([-+]\d\d)(\d\d)$/$1:$2/; # SQLite requires a very specific timezone format
+      $insert_coin->execute($coin->{symbol}, $currency, $date,
+        $coin->{show_symbol}, 
         $coin->{name}, $coin->{rank}, 
         from_big_num($coin->{price}), 
         from_big_num($coin->{market_cap}), 
@@ -108,11 +111,13 @@ foreach my $currency (@currencies) {
         from_big_num($coin->{delta_7d}), from_big_num($coin->{delta_30d}))
         or exit_error("insert_coin failed");
       foreach my $market (@{$coin->{markets}}) {
-        $insert_market->execute($coin->{symbol}, $date, $market->{symbol}, 
+        $insert_market->execute($coin->{symbol}, $currency,
+          $date, $market->{symbol}, 
           from_big_num($market->{volume_24h}), from_big_num($market->{price}))
           or exit_error("insert_market failed");
         foreach my $exchange (@{$market->{exchanges}}) {
-          $insert_exchange->execute($coin->{symbol}, $date, $market->{symbol}, 
+          $insert_exchange->execute($coin->{symbol}, $currency,
+            $date, $market->{symbol}, 
             $exchange->{name}, 
             from_big_num($exchange->{volume_24h}),
             from_big_num($exchange->{price}))
