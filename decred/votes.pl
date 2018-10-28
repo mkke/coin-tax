@@ -6,6 +6,7 @@ use Carp;
 use LWP::Simple;
 use Time::HiRes qw(usleep time);
 use Getopt::Long;
+use DBI;
 
 use constant ATOMS_PER_DECRED => 10**8;
 
@@ -14,6 +15,15 @@ my $addToAccounting = 0;
 my $accountingCmd = "../bitcoin-taxes";
 my $accountingCurrency = "EUR";
 GetOptions("year=i" => \$exportYear, "add-to-accounting" => \$addToAccounting, "accounting-cmd=s" => \$accountingCmd);
+
+# initialize rawtx cache
+my $dbname = "dbi:SQLite:dbname=$ENV{HOME}/.decred-votes.db";
+my $dbh = DBI->connect($dbname) or die("$dbname: cannot connect");
+$dbh->do("CREATE TABLE IF NOT EXISTS rawtx_cache (blockhash TEXT, txid TEXT, height INTEGER, rawtx TEXT, PRIMARY KEY (blockhash, txid))") or die("create table rawtx_cache failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS rawtx_cache_height ON rawtx_cache(height, txid)") or die("create index raxtx_cache_height failed");
+my $select_blockhash_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE blockhash = ? AND txid = ?") or die("select_blockhash_txid prepare failed: $!");
+my $select_height_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE height = ? AND txid = ?") or die("select_height_txid prepare failed: $!");
+my $insert_rawtx = $dbh->prepare("INSERT INTO rawtx_cache (blockhash, txid, height, rawtx) VALUES (?, ?, ?, ?)") or die("insert_rawtx prepare failed");
 
 my $transactions = parse_json("dcrctl --wallet listtransactions '*' 1000 0 1");
 my $balances = parse_json("dcrctl --wallet getbalance");
@@ -280,25 +290,54 @@ sub get_rawtx {
   my $blockhash = shift;
   my $txid = shift;
 
+  $select_blockhash_txid->execute(lc($blockhash), lc($txid)) or die "select_blockhash_txid failed";
+  my $rawtx = $select_blockhash_txid->fetchrow_array;
+  if (defined $rawtx) {
+    return decode_json($rawtx);
+  }
+
   my $block = get_block($blockhash);
   foreach my $txcand (@{$block->{rawtx}}) {
     if (lc($txcand->{txid}) eq lc($txid)) {
+      insert_rawtx($block, $txid, $txcand);
       return $txcand;
     } 
   }
   foreach my $txcand (@{$block->{rawstx}}) {
     if (lc($txcand->{txid}) eq lc($txid)) {
+      insert_rawtx($block, $txid, $txcand);
       return $txcand;
     } 
   }
   croak "txid $txid not found in block $blockhash";
 }
 
+sub get_height_rawtx {
+  my $height = shift;
+  my $txid = shift;
+
+  $select_height_txid->execute($height, lc($txid)) or die "select_height_txid failed";
+  my $rawtx = $select_height_txid->fetchrow_array;
+  if (defined $rawtx) {
+    return decode_json($rawtx);
+  }
+
+  return get_rawtx(get_blockhash($height), $txid);
+}
+
+sub insert_rawtx {
+  my $block = shift;
+  my $txid  = shift;
+  my $rawtx = shift;
+
+  $insert_rawtx->execute(lc($block->{hash}), lc($txid), $block->{height}, encode_json($rawtx)) or die "insert_rawtx failed";
+}
+
 sub get_vin_address {
   my $vin = shift;
 
   if (exists $vin->{txid}) {
-    my $tx = get_rawtx(get_blockhash($vin->{blockheight}), $vin->{txid});
+    my $tx = get_height_rawtx($vin->{blockheight}, $vin->{txid});
     my $vin_vout = @{$tx->{vout}}[$vin->{vout}];
     if (exists $vin_vout->{scriptPubKey} && exists $vin_vout->{scriptPubKey}->{addresses}) {
       my @addresses = @{$vin_vout->{scriptPubKey}->{addresses}};
@@ -317,7 +356,7 @@ sub traverse_unseen_own_txid_fees {
 
   my $consolidating_tx_fees = 0;
   if (!$seen_txid{$txid}) {
-    my $funding_tx = get_rawtx(get_blockhash($blockheight), $txid);
+    my $funding_tx = get_height_rawtx($blockheight, $txid);
     my $is_consolidating = 0;
     my $funding_tx_fees = 0;
     foreach my $funding_vin (@{$funding_tx->{vin}}) {
