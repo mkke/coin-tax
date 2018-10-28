@@ -5,6 +5,14 @@ api_key=123
 api_secret=456
 db=dbi:SQLite:dbname=~/.BitcoinTaxes.db
 
+[Coinlib]
+# Powered by Coinlib API https://coinlib.io/apidocs
+api=https://coinlib.io/api/v1
+api_key=123
+db=dbi:SQLite:dbname=~/.coinlib.db
+coins=BTC,LTC,ETH
+currencies=EUR
+
 [Coinlib-Historical]
 # Powered by Coinlib API https://coinlib.io/apidocs
 api=

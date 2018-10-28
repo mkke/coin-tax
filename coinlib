@@ -1,0 +1,149 @@
+#!/usr/bin/perl -w
+use strict;
+use Config::Tiny;
+use Getopt::Long;
+use DBI;
+use WWW::Curl::Easy; # LWP::UserAgent has problems with coinlib
+use URI;
+use JSON::PP;
+use Math::BigFloat;
+use Date::Manip::Date;
+
+my $quiet = 0;
+GetOptions("quiet" => \$quiet);
+
+my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
+my $dbname = $config->{Coinlib}->{db} or exit_error("db not configured");
+$dbname =~ s/~/$ENV{HOME}/;
+my @coins = split(/,/, $config->{Coinlib}->{coins}) or exit_error("coins not configured");
+my @currencies = split(/,/, $config->{Coinlib}->{currencies}) or exit_error("currencies not configured");
+
+my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
+# numeric values are stored as TEXT to not loose precision
+$dbh->do("CREATE TABLE IF NOT EXISTS coins (symbol TEXT, date DATETIME, show_symbol TEXT, name TEXT, rank INTEGER, price TEXT, market_cap TEXT, total_volume_24h TEXT, low_24h TEXT, high_24h TEXT, delta_1h TEXT, delta_24h TEXT, delta_7d TEXT, delta_30d TEXT, PRIMARY KEY (symbol, date))") or exit_error("create table coins failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS markets (coin_symbol TEXT, date DATETIME, symbol TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, date, symbol), FOREIGN KEY (coin_symbol, date) REFERENCES coins(symbol, date))") or exit_error("create table markets failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS exchanges (coin_symbol TEXT, date DATETIME, symbol TEXT, name TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, date, symbol, name), FOREIGN KEY (coin_symbol, date, symbol) REFERENCES markets(coin_symbol, date, symbol))") or exit_error("create table exchanges failed");
+$dbh->do("CREATE TABLE IF NOT EXISTS remaining (endpoint TEXT PRIMARY KEY, date DATETIME, remaining INTEGER)") or exit_error("create table remaining failed");
+
+my $insert_coin = $dbh->prepare("INSERT OR REPLACE INTO coins (symbol, date, show_symbol, name, rank, price, market_cap, total_volume_24h, low_24h, high_24h, delta_1h, delta_24h, delta_7d, delta_30d) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_coin prepare failed");
+my $insert_market = $dbh->prepare("INSERT OR REPLACE INTO markets (coin_symbol, date, symbol, volume_24h, price) VALUES (?, ?, ?, ?, ?)") or exit_error("insert_market prepare failed");
+my $insert_exchange = $dbh->prepare("INSERT OR REPLACE INTO exchanges (coin_symbol, date, symbol, name, volume_24h, price) VALUES (?, ?, ?, ?, ?, ?)") or exit_error("insert_exchange prepare failed");
+my $insert_remaining = $dbh->prepare("INSERT OR REPLACE INTO remaining (endpoint, date, remaining) VALUES (?, ?, ?)") or exit_error("insert_remaining prepare failed");
+my $select_remaining = $dbh->prepare("SELECT * FROM remaining WHERE endpoint = ?") or exit_error("select_remaining prepare failed");
+
+my $json = JSON::PP->new->utf8->allow_blessed->allow_bignum->pretty;
+
+my $api = URI->new($config->{Coinlib}->{api}) or exit_error("api url not configured");
+my $api_key = $config->{Coinlib}->{api_key} or exit_error("api_key not configured");
+
+my $curl = WWW::Curl::Easy->new;
+#$curl->setopt(CURLOPT_HEADER,1);
+
+my $remaining = 180;
+$select_remaining->execute("coin") or exit_error("select_remaining failed");
+my $row;
+if (defined($row = $select_remaining->fetchrow_hashref)) {
+  my $date = Date::Manip::Date->new($row->{date});
+  my $start_of_hour = $date->new('now');
+  $start_of_hour->prev(undef, 1, [undef, 0, 0]);
+
+  if ($date->cmp($start_of_hour) >= 0) {
+    $remaining = $row->{remaining};
+  }
+}
+if (!$quiet) {
+  print "$remaining coin API calls remaining in current interval\n";
+}
+
+$dbh->begin_work();
+foreach my $currency (@currencies) {
+  my @coinsLeft = @coins;
+  
+  while (@coinsLeft) {
+    my @coinsCall = ();
+    
+    foreach my $i (1..10) {
+      push @coinsCall, shift @coinsLeft;
+      if (!@coinsLeft or (scalar @coinsCall >= $remaining)) {
+        last;
+      }
+    }
+    if (!@coinsCall) {
+      print "no API requests remaining\n";
+      exit 0;
+    }
+
+    my $url = URI->new($api . "/coin");
+    $url->query_form("key" => $api_key, 
+                     "pref" => $currency, "symbol" => join(",", @coinsCall));
+    if (!$quiet) {
+      print "requesting $url\n";
+    }
+    $curl->setopt(CURLOPT_URL, $url);
+
+    my $response_body;
+    $curl->setopt(CURLOPT_WRITEDATA,\$response_body);
+ 
+    my $retcode = $curl->perform;
+    if ($retcode == 0) {
+      my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
+      if ($response_code != 200) {
+        exit_error("HTTP response code " . $response_code);
+      }
+    } else {
+      exit_error("curl error code $retcode: " . $curl->strerror($retcode) . " " . $curl->errbuf . "\n");
+    }
+
+    my $json_cl = $json->decode($response_body);
+
+    foreach my $coin (@{$json_cl->{coins}}) {
+      my $date = Date::Manip::Date->new("epoch ".$coin->{last_updated_timestamp})->printf("%O%z");
+      $insert_coin->execute($coin->{symbol}, $date, $coin->{show_symbol}, 
+        $coin->{name}, $coin->{rank}, 
+        from_big_num($coin->{price}), 
+        from_big_num($coin->{market_cap}), 
+        from_big_num($coin->{total_volume_24h}), 
+        from_big_num($coin->{low_24h}), from_big_num($coin->{high_24h}), 
+        from_big_num($coin->{delta_1h}), from_big_num($coin->{delta_24h}), 
+        from_big_num($coin->{delta_7d}), from_big_num($coin->{delta_30d}))
+        or exit_error("insert_coin failed");
+      foreach my $market (@{$coin->{markets}}) {
+        $insert_market->execute($coin->{symbol}, $date, $market->{symbol}, 
+          from_big_num($market->{volume_24h}), from_big_num($market->{price}))
+          or exit_error("insert_market failed");
+        foreach my $exchange (@{$market->{exchanges}}) {
+          $insert_exchange->execute($coin->{symbol}, $date, $market->{symbol}, 
+            $exchange->{name}, 
+            from_big_num($exchange->{volume_24h}),
+            from_big_num($exchange->{price}))
+            or exit_error("insert_exchange failed");
+        }
+      }
+    }
+
+    $remaining = $json_cl->{remaining};
+    $insert_remaining->execute("coin", Date::Manip::Date->new('now')->printf("%O%z"), $remaining);
+  }  
+}
+$dbh->commit();
+
+sub exit_error {
+  my $message = shift;
+  print("$message\n");
+  exit 1;
+}
+
+sub from_big_num {
+  my $value = shift;
+  if (defined $value) {
+    if (eval { $value->isa('Math::BigInt') } || eval { $value->isa('Math::BigFloat') }) {
+      return $value->bdstr;
+    } else {
+      return $value;
+    }
+  } else {
+    return undef;
+  }
+}
+
+
