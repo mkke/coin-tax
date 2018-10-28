@@ -4,6 +4,7 @@ api=https://api.bitcoin.tax/v1
 api_key=123
 api_secret=456
 db=dbi:SQLite:dbname=~/.BitcoinTaxes.db
+price_query_cmd=coinlib -s $SYMBOL -c $CURRENCY -d $DATE -f price
 
 [Coinlib]
 # Powered by Coinlib API https://coinlib.io/apidocs

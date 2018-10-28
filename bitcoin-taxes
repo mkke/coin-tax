@@ -9,6 +9,8 @@ use JSON::PP;
 use Math::BigFloat;
 use Date::Manip::Date;
 
+my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
+
 my @actions = qw(BUY FEE GIFTIN INCOME LOST MINING SELL SPEND STOLEN);
 my %valid_action = map { $_ => 1 } @actions;
 
@@ -18,6 +20,7 @@ my $update = 0;
 my $add = 0;
 my ($action, $date, $volume, $symbol, $price, $total, $currency, $exchange,
     $exchangeid, $fee, $feecurrency, $memo, $txhash, $sender, $recipient);
+my $query_price = 0;
 my $quiet = 0;
 GetOptions("update" => \$update, "year=i" => \$startYear, "end-year=i" => \$endYear,
            "action=s" => \$action, "date=s" => \$date, "volume=s" => \$volume,
@@ -25,7 +28,7 @@ GetOptions("update" => \$update, "year=i" => \$startYear, "end-year=i" => \$endY
            "currency=s" => \$currency, "exchange=s" => \$exchange, "exchangeid=s" => \$exchangeid,
            "fee=s" => \$fee, "feecurrency=s" => \$feecurrency, "memo=s" => \$memo,
            "txhash=s" => \$txhash, "sender=s" => \$sender, "recipient=s" => \$recipient,
-           "quiet" => \$quiet);
+           "query-price" => \$query_price, "quiet" => \$quiet);
 if (defined($action)) {
   if (!exists $valid_action{$action}) {
     print "'$action' is not a supported action\n";
@@ -59,8 +62,23 @@ if (defined($action)) {
   $fee = as_big_float($fee, "fee");
 
   if (!defined $price && !defined $total) {
-    print("Exactly one of the options price, total must be specified\n");
-    exit 1;
+    if ($query_price) {
+      my $q_date = $date->printf("%O%z");
+      my $price_query_cmd = $config->{BitcoinTaxes}->{price_query_cmd} or exit_error("price_query_cmd not configured");
+      $price_query_cmd =~ s/\$SYMBOL/$symbol/gs;
+      $price_query_cmd =~ s/\$CURRENCY/$currency/gs;
+      $price_query_cmd =~ s/\$DATE/$q_date/gs;
+      my $price_info = `$price_query_cmd`;
+      if ($? != 0) {
+        chomp($price_info);
+        exit_error("querying price failed: $price_info ($price_query_cmd)");
+      }
+      chomp($price_info);
+      $price = $price_info;
+    } else {
+      print("Exactly one of the options price, total must be specified (or --query-price enabled)\n");
+      exit 1;
+    }
   } elsif (defined $price && defined $total) {
     print("Only one of the options price, total must be specified\n");
     exit 1;
@@ -73,7 +91,8 @@ if (!$update && !$add) {
   print("       bitcoin-taxes --action={BUY|FEE|GIFTIN|INCOME|LOST|MINING|SELL|SPEND|STOLEN}\n"); 
   print("                     --date=<date>\n");
   print("                     --volume=<volume> --symbol=<crypto-symbol>\n"); 
-  print("                     { --price=<price> | --total=<total> } --currency=<ISO 4217 currency>\n"); 
+  print("                     { --price=<price> | --total=<total> | --query-price }\n");
+  print("                     --currency=<ISO 4217 currency>\n"); 
   print("                     [ --exchange=<name> ] [ --exchangeid=<id> ]\n"); 
   print("                     [ --fee=<fee> --feecurrency=<ISO 4217 currency> ]\n"); 
   print("                     [ --memo=<memo text> ] [ --txhash=<hash> ]\n"); 
@@ -104,7 +123,6 @@ sub as_big_float {
 }
 
 
-my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
 my $dbname = $config->{BitcoinTaxes}->{db} or exit_error("db not configured");
 $dbname =~ s/~/$ENV{HOME}/;
 

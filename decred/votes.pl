@@ -12,8 +12,7 @@ use constant ATOMS_PER_DECRED => 10**8;
 
 my $exportYear = -1; # 0 = all
 my $addToAccounting = 0;
-my $accountingCmd = "../bitcoin-taxes";
-my $accountingCurrency = "EUR";
+my $accountingCmd = "../bitcoin-taxes --query-price --currency=EUR";
 GetOptions("year=i" => \$exportYear, "add-to-accounting" => \$addToAccounting, "accounting-cmd=s" => \$accountingCmd);
 
 # initialize rawtx cache
@@ -162,8 +161,7 @@ foreach my $t (@$transactions) {
         "exchangeid" => $ticket_txid,
         "symbol" => "DCR",
         "volume" => sprintf("%.8f", $net_reward),
-        "txhash" => $ticket_txid,
-        "currency" => $accountingCurrency
+        "txhash" => $ticket_txid
       });
     }
   } elsif ($t->{txtype} eq "regular") {
@@ -212,11 +210,14 @@ if ($exportYear >= 0) {
 }
 
 if (scalar @accounting) {
+  print "\nrecording new transactions...\n";
   foreach my $t (reverse @accounting) {
-    my $code = system($accountingCmd, map { "--$_=$t->{$_}" } keys %$t);
-    if ($code == 2) {
+    my $code = system($accountingCmd . " " . join(" ", map { "\"--$_=$t->{$_}\"" } keys %$t));
+    if ($code>>8 == 2) {
+      print("transaction already recorded, skipping older transactions\n");
       last;
     } elsif ($code != 0) {
+      print("recording transaction failed with code = $code\n");
       exit 1;
     }
     exit 0;
