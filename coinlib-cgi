@@ -25,7 +25,7 @@ my $select_coin = $dbh->prepare("WITH c AS (SELECT * FROM coins WHERE symbol = ?
 my $select_markets = $dbh->prepare("SELECT * FROM markets WHERE coin_symbol = ? AND currency = ? AND date = ?") or exit_error("select_markets prepare failed");
 my $select_exchanges = $dbh->prepare("SELECT * FROM exchanges WHERE coin_symbol = ? AND currency = ? AND date = ?") or exit_error("select_exchanges prepare failed");
 
-my $json = JSON->new->utf8->pretty;
+my $json = JSON->new->utf8;
 
 my $q_date = $cgi->param("date") || "now";
 my $date = Date::Manip::Date->new($q_date)->printf("%O%z");
