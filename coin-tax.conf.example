@@ -18,3 +18,8 @@ currencies=EUR
 # Powered by Coinlib API https://coinlib.io/apidocs
 api=
 
+[Etherscan]
+api=http://api.etherscan.io/api
+api_key=123
+db=dbi:SQLite:dbname=~/.Etherscan.db
+

@@ -1,0 +1,213 @@
+#!/usr/bin/perl -w
+use strict;
+use Config::Tiny;
+use Getopt::Long;
+use DBI;
+use LWP::UserAgent;
+use URI;
+use JSON::PP;
+use Math::BigFloat;
+use Date::Manip::Date;
+use Time::HiRes qw( usleep );
+use Term::ProgressBar::Simple;
+
+my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
+
+my $update = 0;
+my $quiet = 0;
+GetOptions("update" => \$update, "quiet" => \$quiet);
+if (!$update) {
+  print("Usage: etherscan --update [ --quiet ]\n");
+}
+
+my $jsonp = JSON::PP->new->utf8->allow_blessed->allow_bignum->pretty;
+
+my $dbname = $config->{Etherscan}->{db} or exit_error("db not configured");
+$dbname =~ s/~/$ENV{HOME}/;
+
+my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
+# numeric values are stored as TEXT to not loose precision
+
+$dbh->do("CREATE TABLE IF NOT EXISTS txlist (hash TEXT PRIMARY KEY, timestamp DATETIME, blocknumber INTEGER, nonce TEXT, blockhash TEXT, contractaddress TEXT, fromaddress TEXT, toaddress TEXT, value TEXT, transactionindex INTEGER, gas TEXT, gasprice TEXT, gasused TEXT, cumulativegasused TEXT, input TEXT, confirmations TEXT, iserror TEXT, txreceiptstatus TEXT)") or exit_error("create table txlist failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS txlist_timestamp ON txlist(timestamp)") or exit_error("create index txlist_timestamp failed");
+
+$dbh->do("CREATE TABLE IF NOT EXISTS txlistinternal (hash TEXT PRIMARY KEY, timestamp DATETIME, blocknumber INTEGER, contractaddress TEXT, fromaddress TEXT, toaddress TEXT, value TEXT, gas TEXT, gasused TEXT, input TEXT, type TEXT, traceid TEXT, iserror TEXT, errcode TEXT)") or exit_error("create table txlistinternal failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS txlistinternal_timestamp ON txlistinternal(timestamp)") or exit_error("create index txlistinternal_timestamp failed");
+
+$dbh->do("CREATE TABLE IF NOT EXISTS tokentx (hash TEXT PRIMARY KEY, timestamp DATETIME, blocknumber INTEGER, nonce TEXT, blockhash TEXT, fromaddress TEXT, contractaddress TEXT, toaddress TEXT, value TEXT, tokenname TEXT, tokensymbol TEXT, tokendecimal INTEGER, transactionindex INTEGER, gas TEXT, gasprice TEXT, gasused TEXT, cumulativegasused TEXT, input TEXT, confirmations TEXT)") or exit_error("create table tokentx failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS tokentx_timestamp ON tokentx(timestamp)") or exit_error("create index tokentx_timestamp failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS tokentx_tokensymbol ON tokentx(tokensymbol)") or exit_error("create index tokentx_tokensymbol failed");
+
+$dbh->do("CREATE TABLE IF NOT EXISTS tokenbalance (address TEXT, timestamp DATETIME, contractaddress TEXT, tokensymbol TEXT, tokendecimal INTEGER, balance TEXT, PRIMARY KEY (address, timestamp, contractaddress))") or exit_error("create table tokenbalance failed");
+$dbh->do("CREATE INDEX IF NOT EXISTS tokenbalance_timestamp ON tokenbalance(timestamp)") or exit_error("create index tokenbalance_timestamp failed");
+
+$dbh->do("CREATE TABLE IF NOT EXISTS remaining (endpoint TEXT PRIMARY KEY, date DATETIME, remaining INTEGER)") or exit_error("create table remaining failed");
+
+my $insert_txlist = $dbh->prepare("INSERT OR REPLACE INTO txlist(hash, timestamp, blocknumber, nonce, blockhash, contractaddress, fromaddress, toaddress, value, transactionindex, gas, gasprice, gasused, cumulativegasused, input, confirmations, iserror, txreceiptstatus) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_txlist prepare failed");
+my $insert_txlistinternal = $dbh->prepare("INSERT OR REPLACE INTO txlistinternal(hash, timestamp, blocknumber, contractaddress, fromaddress, toaddress, value, gas, gasused, input, type, traceid, iserror, errcode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_txlistinternal prepare failed");
+my $insert_tokentx = $dbh->prepare("INSERT OR REPLACE INTO tokentx(hash, timestamp, blocknumber, nonce, blockhash, fromaddress, contractaddress, toaddress, value, tokenname, tokensymbol, tokendecimal, transactionindex, gas, gasprice, gasused, cumulativegasused, input, confirmations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)") or exit_error("insert_tokentx prepare failed");
+my $insert_tokenbalance = $dbh->prepare("INSERT OR REPLACE INTO tokenbalance(address, timestamp, contractaddress, tokensymbol, tokendecimal, balance) VALUES (?, ?, ?, ?, ?, ?)") or exit_error("insert_tokenbalance prepare failed");
+my $insert_remaining = $dbh->prepare("INSERT OR REPLACE INTO remaining (endpoint, date, remaining) VALUES (?, ?, ?)") or exit_error("insert_remaining prepare failed");
+my $select_remaining = $dbh->prepare("SELECT * FROM remaining WHERE endpoint = ?") or exit_error("select_remaining prepare failed");
+
+# get ratelimit accounting
+use constant MAX_CALLS_PER_SECOND => 5;
+
+my $remaining_date = now();
+my $remaining = MAX_CALLS_PER_SECOND;
+$select_remaining->execute("api") or exit_error("select_remaining failed");
+my $row;
+if (defined($row = $select_remaining->fetchrow_hashref)) {
+  $remaining_date = Date::Manip::Date->new($row->{date});
+  $remaining = $row->{remaining};
+}
+
+# block until we comply with ratelimit
+sub wait_ratelimit {
+  my $now = now();
+  my $cmp = $now->cmp($remaining_date);
+  if ($cmp > 0) {
+    $remaining_date = $now;
+    $remaining = MAX_CALLS_PER_SECOND - 1;
+    update_remaining_db();
+    return;
+  } elsif ($cmp == 0 && $remaining > 0) {
+    $remaining--;
+    update_remaining_db();
+    return;
+  }
+
+  while (now()->cmp($remaining_date) <= 0) {
+    usleep(100000);   
+  }
+  $remaining_date = now();
+  $remaining = MAX_CALLS_PER_SECOND - 1;
+  update_remaining_db();
+}
+
+sub update_remaining_db {
+  $insert_remaining->execute("api", as_sqlite_date($remaining_date), $remaining) or exit_error("insert_remaining failed");
+}
+
+sub now {
+  return Date::Manip::Date->new('now');
+}
+
+sub as_sqlite_date {
+  my $dmd = shift;
+  my $date = $dmd->printf("%O%z");
+  $date =~ s/([-+]\d\d)(\d\d)$/$1:$2/; # SQLite requires a very specific timezone format
+  return $date;
+}
+
+my $ua = LWP::UserAgent->new;
+$ua->agent("etherscan cli/1.0");
+# API-calls are rate-limited to 5 per second
+my $api = URI->new($config->{Etherscan}->{api}) or exit_error("api url not configured");
+my $api_key = URI->new($config->{Etherscan}->{api_key}) or exit_error("api_key not configured");
+my $progress;
+
+if ($update) {
+  my @addresses = ();
+  my $path = $config->{Etherscan}->{addresses};
+  $path =~ s/~/$ENV{HOME}/gs;
+  open(my $addresses_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+  while (my $line = <$addresses_fh>) {
+    if ($line =~ /^(0x[0-9a-fA-F]{40}),(.+)$/) {
+      push @addresses, { address => $1, label => $2 };
+    } else {
+      print "$path:$.: invalid syntax\n";
+    }
+  }
+  close $addresses_fh;
+
+  my @tokens = ();
+  $path = $config->{Etherscan}->{tokens};
+  $path =~ s/~/$ENV{HOME}/gs;
+  open(my $tokens_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+  while (my $line  = <$tokens_fh>) {
+    if ($line =~ /^(0x[0-9a-fA-F]{40}),([^,]+),(\d+)$/) {
+      push @tokens, { address => $1, symbol => $2, decimals => $3 };
+    } else {
+      print "$path:$.: invalid syntax\n";
+    }
+  }
+  close $tokens_fh;
+
+  $progress = Term::ProgressBar::Simple->new({ name => 'Querying Etherscan', count => 4 * scalar @addresses, ETA => 'linear', silent => $quiet });
+
+  my $json;
+  foreach my $address (@addresses) {
+    $json = query_api("module" => "account", "action" => "txlist",
+                      "address" => $address->{address}, "sort" => "asc");
+    foreach my $t (@{$json->{result}}) {
+      my $timestamp = Date::Manip::Date->new("epoch " . $t->{timeStamp});
+      # (hash, timestamp, blocknumber, nonce, blockhash, contractaddress, fromaddress, toaddress, value, transactionindex, gas, gasprice, gasused, cumulativegasused, input, confirmations, iserror, txreceiptstatus)
+      $insert_txlist->execute($t->{hash}, as_sqlite_date($timestamp), $t->{blockNumber}, $t->{nonce}, $t->{blockHash}, $t->{contractAddress}, $t->{from}, $t->{to}, $t->{value}, $t->{transactionIndex}, $t->{gas}, $t->{gasPrice}, $t->{gasUsed}, $t->{cumulativeGasUsed}, $t->{input}, $t->{confirmations}, $t->{isError}, $t->{txreceipt_status}) or exit_error("insert_txlist failed");
+    }
+    $progress++;
+
+    $json = query_api("module" => "account", "action" => "txlistinternal",
+                      "address" => $address->{address}, "sort" => "asc");
+    foreach my $t (@{$json->{result}}) {
+      my $timestamp = Date::Manip::Date->new("epoch " . $t->{timeStamp});
+      # (hash, timestamp, blocknumber, contractaddress, fromaddress, toaddress, value, gas, gasused, input, type, traceid, iserror, errcode)
+      $insert_txlistinternal->execute($t->{hash}, as_sqlite_date($timestamp), $t->{blockNumber}, $t->{contractAddress},$t->{from}, $t->{to}, $t->{value}, $t->{gas}, $t->{gasUsed}, $t->{input}, $t->{type}, $t->{traceId}, $t->{isError}, $t->{errCode}) or exit_error("insert_txlistinternal failed");
+    }
+    $progress++;
+
+    $json = query_api("module" => "account", "action" => "tokentx",
+                      "address" => $address->{address}, "sort" => "asc");
+    foreach my $t (@{$json->{result}}) {
+      my $timestamp = Date::Manip::Date->new("epoch " . $t->{timeStamp});
+      $insert_tokentx->execute($t->{hash}, as_sqlite_date($timestamp), $t->{blockNumber}, $t->{nonce}, $t->{blockHash}, $t->{from}, $t->{contractAddress}, $t->{to}, $t->{value}, $t->{tokenName}, $t->{tokenSymbol}, $t->{tokenDecimal}, $t->{transactionIndex}, $t->{gas}, $t->{gasPrice}, $t->{gasUsed}, $t->{cumulativeGasUsed}, $t->{input}, $t->{confirmations}) or exit_error("insert_tokentx failed");
+    }
+    $progress++;
+
+    # get balances
+    foreach my $token (@tokens) {
+      $json = query_api("module" => "account", "action" => "tokenbalance",
+                       "contractaddress" => $token->{address},
+                       "address" => $address->{address},
+                       "tag" => "latest");
+
+      #my $balance = Math::BigFloat->new($json->{result});
+      #$balance->brsft($token->{decimals}, 10);
+      $insert_tokenbalance->execute($address->{address}, $token->{address}, $token->{symbol}, $token->{decimals}, as_sqlite_date(now()), $json->{result}) or exit_error("insert_tokenbalance failed");
+    }
+    $progress++;
+  }
+}
+
+sub query_api {
+  my %form = @_;
+  $form{"apikey"} = $api_key;
+
+  my $url = URI->new($api);
+  $url->query_form(%form);
+
+  wait_ratelimit();
+  if (!$quiet) {
+    $progress->message(sprintf("%s  %d  %s", as_sqlite_date($remaining_date), $remaining, $url));
+  }
+
+  my $res = $ua->get($url);
+  if (!$res->is_success) {
+    print $res->content;
+    exit_error($res->status_line);
+  }
+
+  my $json = $jsonp->decode($res->decoded_content);
+  if ($json->{message} ne "OK" && $json->{message} ne "No transactions found") {
+    exit_error("response message: $json->{message}");
+  }
+  return $json;
+}
+
+sub exit_error {
+  my $message = shift;
+  print("$message\n");
+  exit 1;
+}
+
+
