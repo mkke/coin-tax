@@ -13,16 +13,22 @@ use constant ATOMS_PER_DECRED => 10**8;
 my $exportYear = -1; # 0 = all
 my $addToAccounting = 0;
 my $accountingCmd = "../bitcoin-taxes --query-price --currency=EUR";
-GetOptions("year=i" => \$exportYear, "add-to-accounting" => \$addToAccounting, "accounting-cmd=s" => \$accountingCmd);
+my $incremental = 0;
+my $verbose = 1;
+GetOptions("year=i" => \$exportYear, "add-to-accounting" => \$addToAccounting, "accounting-cmd=s" => \$accountingCmd, "incremental" => \$incremental);
 
 # initialize rawtx cache
 my $dbname = "dbi:SQLite:dbname=$ENV{HOME}/.decred-votes.db";
 my $dbh = DBI->connect($dbname) or die("$dbname: cannot connect");
 $dbh->do("CREATE TABLE IF NOT EXISTS rawtx_cache (blockhash TEXT, txid TEXT, height INTEGER, rawtx TEXT, PRIMARY KEY (blockhash, txid))") or die("create table rawtx_cache failed");
 $dbh->do("CREATE INDEX IF NOT EXISTS rawtx_cache_height ON rawtx_cache(height, txid)") or die("create index raxtx_cache_height failed");
-my $select_blockhash_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE blockhash = ? AND txid = ?") or die("select_blockhash_txid prepare failed: $!");
-my $select_height_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE height = ? AND txid = ?") or die("select_height_txid prepare failed: $!");
+my $select_blockhash_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE blockhash = ? AND txid = ?") or die("select_blockhash_txid prepare failed");
+my $select_height_txid = $dbh->prepare("SELECT rawtx FROM rawtx_cache WHERE height = ? AND txid = ?") or die("select_height_txid prepare failed");
 my $insert_rawtx = $dbh->prepare("INSERT INTO rawtx_cache (blockhash, txid, height, rawtx) VALUES (?, ?, ?, ?)") or die("insert_rawtx prepare failed");
+
+$dbh->do("CREATE TABLE IF NOT EXISTS watermark (id TEXT PRIMARY KEY, blocktime INTEGER)") or die("create table watermark failed");
+my $select_watermark_blocktime = $dbh->prepare("SELECT blocktime FROM watermark WHERE id = ?") or die("select_watermark_blocktime prepare failed");
+my $insert_watermark = $dbh->prepare("INSERT OR REPLACE INTO watermark (id, blocktime) VALUES (?, ?)") or die("insert_watermark prepare failed");
 
 my $transactions = parse_json("dcrctl --wallet listtransactions '*' 1000 0 1");
 my $balances = parse_json("dcrctl --wallet getbalance");
@@ -31,8 +37,28 @@ my %seen_txid = map { $_->{txid} => 1 } @$transactions;
 my %expTicket = ();
 my @accounting = ();
 
-printf("%-19s  %-10s  %-10s  %13s  %12s  %12s  %12s  %12s\n", "Block time", "Category", "TxType", "Amount", "Fee", "PoS reward", "Net reward", "Balance"); 
-print "-" x 114 . "\n";
+my $watermark_tx_blocktime = 0;
+if ($incremental) {
+  $select_watermark_blocktime->execute("tx") or die "select_watermark_blocktime failed";
+  my $new_blocktime = $select_watermark_blocktime->fetchrow_array;
+  if (defined $new_blocktime) {
+    $watermark_tx_blocktime = $new_blocktime;
+  }
+  $verbose = 0;
+}
+
+my $table_header_printed = 0;
+sub print_table_header {
+  if ($verbose) {
+    if (!$table_header_printed) {
+      printf("%-19s  %-10s  %-10s  %13s  %12s  %12s  %12s  %12s\n", "Block time", "Category", "TxType", "Amount", "Fee", "PoS reward", "Net reward", "Balance"); 
+      print "-" x 114 . "\n";
+      $table_header_printed = 1;
+    }
+  }
+}
+print_table_header();
+
 my $sum = 0;
 my $balance = 0;
 my $prevyear = -1;
@@ -40,18 +66,24 @@ my $prev_t = undef;
 my $open_ticketfees = 0;
 my %open_tickets = ();
 foreach my $t (@$transactions) {
+  if (!$verbose && $t->{blocktime} > $watermark_tx_blocktime) {
+    $verbose = 1;
+    print_table_header();
+  }
+
   my $year = (gmtime($t->{blocktime}))[5] + 1900;
   if ($year != $prevyear) {
     if ($prevyear >= 0) {
-      print "-" x 114 . "\n";
-      printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . sprintf(" (rate of return %0.1f%%)", $sum * 100 / ($balance - $sum)), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
-      print "-" x 114 . "\n";
+      if ($verbose) {
+        print "-" x 114 . "\n";
+        printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . sprintf(" (rate of return %0.1f%%)", $sum * 100 / ($balance - $sum)), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
+        print "-" x 114 . "\n";
+      }
     }
     $prevyear = $year;
     $sum = 0;
   }
   if ($t->{txtype} eq "ticket" && ($t->{fee} || 0) != 0 && $t->{vout} == 0) {
-
     my $ticket_tx = get_rawtx($t->{blockhash}, $t->{txid});
     my $ticket_fees = 0;
     my $consolidating_tx_fees = 0;
@@ -70,7 +102,9 @@ foreach my $t (@$transactions) {
 
     $open_ticketfees += $ticket_fees + $consolidating_tx_fees;
     $open_tickets{$t->{txid}} = { ticket_tx => $ticket_tx, ticket_fees => $ticket_fees, consolidating_tx_fees => $consolidating_tx_fees };
-    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee}, "-", "-", '...');
+    if ($verbose) {
+      printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee}, "-", "-", '...');
+    }
   } elsif ($t->{txtype} eq "vote" && $t->{amount} != 0) {
     my $tx = get_rawtx($t->{blockhash}, $t->{txid});
 
@@ -136,7 +170,9 @@ foreach my $t (@$transactions) {
     my $net_reward = $voutOwn - $vinTicket - $ticket->{ticket_fees} - $ticket->{consolidating_tx_fees};
     $sum += $net_reward * ATOMS_PER_DECRED;
     $balance += $net_reward * ATOMS_PER_DECRED;
-    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12.8f  %12.8f  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $voutSum, -$voutStakepool, $pos_reward, $net_reward, $balance / ATOMS_PER_DECRED);
+    if ($verbose) {
+      printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12.8f  %12.8f  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $voutSum, -$voutStakepool, $pos_reward, $net_reward, $balance / ATOMS_PER_DECRED);
+    }
 
     my $expYear = (gmtime($t->{blocktime}))[5] + 1900;
     if (!exists $expTicket{$expYear}) {
@@ -152,7 +188,7 @@ foreach my $t (@$transactions) {
       "Symbol" => "DCR",
       "Volume" => sprintf("%.8f", $net_reward)
     });
-    if ($addToAccounting and $year == 2018) {
+    if ($addToAccounting and $year == 2018 and (!$incremental or $t->{blocktime} > $watermark_tx_blocktime)) {
       push(@accounting, {
         "date" => strftime("%F %T", gmtime($t->{blocktime})) . "Z",
         "action" => "INCOME",
@@ -166,23 +202,31 @@ foreach my $t (@$transactions) {
     }
   } elsif ($t->{txtype} eq "regular") {
     $balance += $t->{amount} * ATOMS_PER_DECRED;
-    printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee} || 0, "-", "-", $balance / ATOMS_PER_DECRED);
+    if ($verbose) {
+      printf("%19s  %-10s  %-10s  %13.8f  %12.8f  %12s  %12s  %12.8f\n", strftime("%F %T", gmtime($t->{blocktime})), $t->{category}, $t->{txtype}, $t->{amount}, $t->{fee} || 0, "-", "-", $balance / ATOMS_PER_DECRED);
+    }
   }
   $prev_t = $t;
 }
-print "-" x 114 . "\n";
+if ($verbose) {
+  print "-" x 114 . "\n";
+}
 if ($open_ticketfees != 0) {
-  printf("%-87s %12.8f  %12.8f\n", "fees payed for live/immature tickets", -$open_ticketfees, -$open_ticketfees);
+  if ($verbose) {
+    printf("%-87s %12.8f  %12.8f\n", "fees payed for live/immature tickets", -$open_ticketfees, -$open_ticketfees);
+  }
   $sum -= $open_ticketfees * ATOMS_PER_DECRED;
   $balance -= $open_ticketfees * ATOMS_PER_DECRED;
 }
 my $start_of_year = mktime(0,0,0,1,0,$prevyear-1900);
 my $end_of_year = mktime(0,0,0,1,0,$prevyear+1-1900);
 my $ror = ($sum * 100 / ($balance - $sum)) * ($end_of_year - $start_of_year) / ($prev_t->{blocktime} - $start_of_year);
-printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . " .. " . strftime("%F", gmtime($prev_t->{blocktime})) . sprintf(" (rate of return annual. %0.1f%%)", $ror), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
-print "=" x 114 . "\n";
+if ($verbose) {
+  printf("%-87s %12.8f  %12.8f\n", "Total " . $prevyear . " .. " . strftime("%F", gmtime($prev_t->{blocktime})) . sprintf(" (rate of return annual. %0.1f%%)", $ror), $sum / ATOMS_PER_DECRED, $balance / ATOMS_PER_DECRED);
+  print "=" x 114 . "\n";
 
-printf("%-100s  %12.8f\n", "Balance", $balances->{cumulativetotal});
+  printf("%-100s  %12.8f\n", "Balance", $balances->{cumulativetotal});
+}
 
 if ($exportYear >= 0) {
   my @exportYears = ();
@@ -222,6 +266,10 @@ if (scalar @accounting) {
     }
     exit 0;
   }
+}
+
+if ($incremental && defined($prev_t)) {
+  $insert_watermark->execute("tx", $prev_t->{blocktime}) or die "insert_watermark failed";
 }
 exit 0; 
 
@@ -373,7 +421,9 @@ sub traverse_unseen_own_txid_fees {
     }
     if ($is_consolidating) {
       $consolidating_tx_fees += $funding_tx_fees;
-      printf("%19s  %-11s %-10s  %13s  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($funding_tx->{blocktime})), "consolidate", "ticket", "-", -$funding_tx_fees, "-", "-", '...');
+      if ($verbose) {
+        printf("%19s  %-11s %-10s  %13s  %12.8f  %12s  %12s  %12s\n", strftime("%F %T", gmtime($funding_tx->{blocktime})), "consolidate", "ticket", "-", -$funding_tx_fees, "-", "-", '...');
+      }
     }
     $seen_txid{$txid} = 1;
   }
