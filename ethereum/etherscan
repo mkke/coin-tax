@@ -173,7 +173,8 @@ if ($update) {
 
       #my $balance = Math::BigFloat->new($json->{result});
       #$balance->brsft($token->{decimals}, 10);
-      $insert_tokenbalance->execute($address->{address}, $token->{address}, $token->{symbol}, $token->{decimals}, as_sqlite_date(now()), $json->{result}) or exit_error("insert_tokenbalance failed");
+      # (address, timestamp, contractaddress, tokensymbol, tokendecimal, balance)
+      $insert_tokenbalance->execute($address->{address}, as_sqlite_date(now()), $token->{address}, $token->{symbol}, $token->{decimals}, $json->{result}) or exit_error("insert_tokenbalance failed");
     }
     $progress++;
   }
