@@ -75,6 +75,7 @@ foreach my $currency (@currencies) {
     }
     if (!@coinsCall) {
       print "no API requests remaining\n";
+      $dbh->rollback();
       exit 0;
     }
 
@@ -95,12 +96,14 @@ foreach my $currency (@currencies) {
       if ($response_code != 200) {
         if ($ignore_transient_errors and $response_code >= 500 and $response_code <=599 
             and defined($time_since_last_success) and $time_since_last_success < 1800) {
+          $dbh->rollback();
           exit 0;
         }
         exit_error("HTTP response code " . $response_code);
       }
     } else {
       if ($ignore_transient_errors and defined($time_since_last_success) and $time_since_last_success < 1800) {
+        $dbh->rollback();
         exit 0;
       }
       exit_error("curl error code $retcode: " . $curl->strerror($retcode) . " " . $curl->errbuf . "\n");
@@ -139,6 +142,9 @@ foreach my $currency (@currencies) {
 
     $remaining = $json_cl->{remaining};
     $insert_remaining->execute("coin", Date::Manip::Date->new('now')->printf("%O%z"), $remaining);
+    if (@coinsLeft) {
+      sleep 1;
+    }
   }  
 }
 $dbh->commit();
@@ -146,6 +152,9 @@ $dbh->commit();
 sub exit_error {
   my $message = shift;
   print("$message\n");
+  if (defined $dbh) {
+    $dbh->rollback();
+  }
   exit 1;
 }
 
