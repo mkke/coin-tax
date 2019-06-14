@@ -188,7 +188,7 @@ foreach my $t (@$transactions) {
       "Symbol" => "DCR",
       "Volume" => sprintf("%.8f", $net_reward)
     });
-    if ($addToAccounting and $year == 2018 and (!$incremental or $t->{blocktime} > $watermark_tx_blocktime)) {
+    if ($addToAccounting and (!$incremental or $t->{blocktime} > $watermark_tx_blocktime)) {
       push(@accounting, {
         "date" => strftime("%F %T", gmtime($t->{blocktime})) . "Z",
         "action" => "INCOME",
@@ -256,6 +256,7 @@ if ($exportYear >= 0) {
 if (scalar @accounting) {
   print "\nrecording new transactions...\n";
   foreach my $t (reverse @accounting) {
+    print "$t->{date}  $t->{memo}\n";
     my $code = system($accountingCmd . " " . join(" ", map { "\"--$_=$t->{$_}\"" } keys %$t));
     if ($code>>8 == 2) {
       print("transaction already recorded, skipping older transactions\n");
@@ -264,7 +265,6 @@ if (scalar @accounting) {
       print("recording transaction failed with code = $code\n");
       exit 1;
     }
-    exit 0;
   }
 }
 

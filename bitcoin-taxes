@@ -46,6 +46,7 @@ if (defined($action)) {
       exit 1;
     }
     $date = $dmd;
+    $startYear = $endYear = $date->printf("%Y");
   }
   if (!defined $symbol) {
     print "Option symbol must be specified\n";
