@@ -10,7 +10,8 @@ use Math::BigFloat;
 use Date::Manip::Date;
 
 my $quiet = 0;
-GetOptions("quiet" => \$quiet);
+my $ignore_transient_errors = 0;
+GetOptions("quiet" => \$quiet, "ignore-transient-errors" => \$ignore_transient_errors);
 
 my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
 my $dbname = $config->{Coinlib}->{db} or exit_error("db not configured");
@@ -41,6 +42,7 @@ my $curl = WWW::Curl::Easy->new;
 #$curl->setopt(CURLOPT_HEADER,1);
 
 my $remaining = 180;
+my $time_since_last_success = undef;
 $select_remaining->execute("coin") or exit_error("select_remaining failed");
 my $row;
 if (defined($row = $select_remaining->fetchrow_hashref)) {
@@ -51,6 +53,8 @@ if (defined($row = $select_remaining->fetchrow_hashref)) {
   if ($date->cmp($start_of_hour) >= 0) {
     $remaining = $row->{remaining};
   }
+
+  $time_since_last_success = $date->calc($date->new('now'))->printf('%sys');
 }
 if (!$quiet) {
   print "$remaining coin API calls remaining in current interval\n";
@@ -71,6 +75,7 @@ foreach my $currency (@currencies) {
     }
     if (!@coinsCall) {
       print "no API requests remaining\n";
+      $dbh->rollback();
       exit 0;
     }
 
@@ -89,9 +94,18 @@ foreach my $currency (@currencies) {
     if ($retcode == 0) {
       my $response_code = $curl->getinfo(CURLINFO_HTTP_CODE);
       if ($response_code != 200) {
+        if ($ignore_transient_errors and $response_code >= 500 and $response_code <=599 
+            and defined($time_since_last_success) and $time_since_last_success < 1800) {
+          $dbh->rollback();
+          exit 0;
+        }
         exit_error("HTTP response code " . $response_code);
       }
     } else {
+      if ($ignore_transient_errors and defined($time_since_last_success) and $time_since_last_success < 1800) {
+        $dbh->rollback();
+        exit 0;
+      }
       exit_error("curl error code $retcode: " . $curl->strerror($retcode) . " " . $curl->errbuf . "\n");
     }
 
@@ -128,6 +142,9 @@ foreach my $currency (@currencies) {
 
     $remaining = $json_cl->{remaining};
     $insert_remaining->execute("coin", Date::Manip::Date->new('now')->printf("%O%z"), $remaining);
+    if (@coinsLeft) {
+      sleep 1;
+    }
   }  
 }
 $dbh->commit();
@@ -135,6 +152,9 @@ $dbh->commit();
 sub exit_error {
   my $message = shift;
   print("$message\n");
+  if (defined $dbh) {
+    $dbh->rollback();
+  }
   exit 1;
 }
 
