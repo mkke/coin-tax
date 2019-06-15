@@ -1,0 +1,246 @@
+#!/usr/bin/perl -w
+use strict;
+use Config::Tiny;
+use DBI;
+use Math::BigFloat;
+use Date::Manip::Date;
+use Time::Local;
+use POSIX qw(strftime);
+
+my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME}/.coin-tax: not found");
+
+my $dbname = $config->{Etherscan}->{db} or exit_error("db not configured");
+$dbname =~ s/~/$ENV{HOME}/;
+
+my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
+# numeric values are stored as TEXT to not loose precision
+
+sub now {
+  return Date::Manip::Date->new('now');
+}
+
+sub as_sqlite_date {
+  my $dmd = shift;
+  my $date = $dmd->printf("%O%z");
+  $date =~ s/([-+]\d\d)(\d\d)$/$1:$2/; # SQLite requires a very specific timezone format
+  return $date;
+}
+
+sub from_sqlite_date {
+  my $date = shift;
+  my $dmd = Date::Manip::Date->new($date);
+  return $dmd->secs_since_1970_GMT();
+}
+
+my $select_tokenbalance = $dbh->prepare("select tokensymbol, tokendecimal, max(timestamp) as timestamp, sum(balance) as balance from tokenbalance as t1 where timestamp = (select max(timestamp) from tokenbalance as t2 where t1.address = t2.address and t1.contractaddress = t2.contractaddress and timestamp <= ?) group by tokensymbol, tokendecimal;") or exit_error("select_tokenbalance prepare failed");
+my $select_txlist = $dbh->prepare("select timestamp, contractaddress, fromaddress, toaddress, value, gasused, gasprice, iserror from txlist union all select timestamp, contractaddress, fromaddress, toaddress, value, gasused, 0, iserror from txlistinternal order by timestamp asc;") or exit_error("select_txlist prepare failed");
+my $select_tokentx = $dbh->prepare("select timestamp, contractaddress, fromaddress, toaddress, value, tokenname, tokensymbol, tokendecimal, gasused, gasprice from tokentx order by timestamp asc;") or exit_error("select_tokentx prepare failed");
+
+my %token = ();
+my $path = $config->{Etherscan}->{tokens};
+$path =~ s/~/$ENV{HOME}/gs;
+open(my $tokens_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+while (my $line  = <$tokens_fh>) {
+  chomp($line);
+  if ($line eq "" || $line =~ /^#/) {
+    next;
+  }
+
+  my @fields = split(/,/, $line);
+
+  $token{lc($fields[0])} = { "addr" => $fields[0], "tokenSymbol" => $fields[1], "tokenDecimal" => $fields[2] };
+}
+close $tokens_fh;
+
+my %addr = ();
+sub addr {
+  my $a = lc(shift);
+  if (exists $addr{$a} && exists $addr{$a}->{label}) {
+    return $addr{$a}->{label};
+  }
+  return $a;
+}
+
+sub isOwnAddr {
+  my $a = lc(shift);
+  return exists $addr{$a} && ($addr{$a}->{own} || 0);
+} 
+
+$path = $config->{Etherscan}->{addresses};
+$path =~ s/~/$ENV{HOME}/gs;
+open(my $addresses_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+while (my $line = <$addresses_fh>) {
+  chomp($line);
+  if ($line eq "" || $line =~ /^#/) {
+    next;
+  }
+
+  my @fields = split(/,/, $line);
+
+  $addr{lc($fields[0])} = { "addr" => $fields[0], "label" => $fields[1], "own" => 1 };
+}
+close $addresses_fh;
+
+$path = $config->{Etherscan}->{address_labels};
+$path =~ s/~/$ENV{HOME}/gs;
+open(my $address_labels_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+while (my $line = <$address_labels_fh>) {
+  chomp($line);
+  if ($line eq "" || $line =~ /^#/) {
+    next;
+  }
+
+  my @fields = split(/,/, $line);
+
+  $addr{lc($fields[0])} = { "addr" => $fields[0], "label" => $fields[1], "own" => 0 };
+}
+close $address_labels_fh;
+
+my %token_label = ();
+$path = $config->{Etherscan}->{token_labels};
+$path =~ s/~/$ENV{HOME}/gs;
+open(my $token_labels_fh, "<", $path) or exit_error($path . ": cannot open: $!");
+while (my $line = <$token_labels_fh>) {
+  chomp($line);
+  if ($line eq "" || $line =~ /^#/) {
+    next;
+  }
+
+  my @fields = split(/,/, $line);
+
+  $token_label{lc($fields[0])} = { "contractAddress" => $fields[0], "symbol" => $fields[1], "decimal" => $fields[2] };
+}
+close $token_labels_fh;
+
+my @transactions = ();
+$select_txlist->execute() or exit_error("select_txlist failed");
+my $tx;
+while (defined($tx = $select_txlist->fetchrow_hashref)) {
+  push @transactions, {
+    timeStamp => from_sqlite_date($tx->{timestamp}),
+    contractAddress => $tx->{contractaddress},
+    from => $tx->{fromaddress},
+    to => $tx->{toaddress},
+    gasUsed => $tx->{gasused},
+    gasPrice => $tx->{gasprice},
+    value => $tx->{value},
+    isError => $tx->{iserror}
+  };
+}
+
+$select_tokentx->execute() or exit_error("select_tokentx failed");
+while (defined($tx = $select_tokentx->fetchrow_hashref)) {
+  push @transactions, {
+    timeStamp => from_sqlite_date($tx->{timestamp}),
+    contractAddress => $tx->{contractaddress},
+    from => $tx->{fromaddress},
+    to => $tx->{toaddress},
+    gasUsed => $tx->{gasused},
+    gasPrice => $tx->{gasprice},
+    value => $tx->{value},
+    tokenName => $tx->{tokenname},
+    tokenSymbol => $tx->{tokensymbol},
+    tokenDecimal => $tx->{tokendecimal},
+  };
+}
+
+@transactions = sort { $a->{timeStamp} <=> $b->{timeStamp} } @transactions;
+
+my %balance = ();
+my $gasYearSum = 0;
+sub addBalance {
+  my $symbol = shift;
+  my $decimal = shift;
+  my $value = shift;
+
+  if (!exists $balance{$symbol}) {
+    $balance{$symbol} = { "tokenSymbol" => $symbol, "tokenDecimal" => $decimal, "value" => $value };
+  } else {
+    $balance{$symbol}->{value} += $value;
+  }
+}
+
+sub printBalance {
+  my $year = shift;
+  my $erc20_balance_epoch = shift;
+  my $dmd_balance_epoch = Date::Manip::Date->new("epoch " . $erc20_balance_epoch);
+
+  print "-" x 156 . "\n";
+  my $printHeading = 1;
+  foreach my $symbol (sort keys %balance) {
+    my $dec = $balance{$symbol}->{tokenDecimal};
+    my $value = ($balance{$symbol}->{value} >= 0 ? "+" : "-") . sprintf("%0" . ($dec + 1) . ".0f", abs($balance{$symbol}->{value}));
+    printf("%-40s %18s%-19s %-6s\n", $printHeading ? "Balance " . $year : "",
+          substr($value, 0, length($value) - $dec), $dec > 0 ? "." . substr($value, length($value) - $dec) : "",
+          $balance{$symbol}->{tokenSymbol});
+    $printHeading = 0;
+  }
+
+  $select_tokenbalance->execute(as_sqlite_date($dmd_balance_epoch)) or exit_error("select_tokenbalance failed");
+  my $tokenbalance;
+  while (defined($tokenbalance = $select_tokenbalance->fetchrow_hashref)) {
+    my $dec = $tokenbalance->{tokendecimal};
+    my $value = sprintf("%0" . ($dec + 1) . ".0f", abs($tokenbalance->{balance}));
+    printf("%-28s %18s%-19s %-6s\n", "ERC20 balanceOf() on " . strftime("%F %T", gmtime(from_sqlite_date($tokenbalance->{timestamp}))),
+        substr($value, 0, length($value) - $dec), $dec > 0 ? "." . substr($value, length($value) - $dec) : "",
+        $tokenbalance->{tokensymbol});
+  }
+  if ($gasYearSum > 0) {
+    my $dec = 18;
+    my $value = sprintf("%0" . ($dec + 1) . ".0f", $gasYearSum);
+    printf("%-40s %18s%-19s %-6s\n", "Gas payed",
+          substr($value, 0, length($value) - $dec), $dec > 0 ? "." . substr($value, length($value) - $dec) : "",
+          "ETH");
+  }
+  print "-" x 156 . "\n";
+}
+
+my $prevyear = -1;
+foreach my $t (@transactions) {
+  my $year = (gmtime($t->{timeStamp}))[5] + 1900;
+  if ($year != $prevyear) {
+    if ($prevyear >= 0) {
+      printBalance($prevyear, timegm(0, 0, 0, 1, 0, $prevyear + 1) - 1);
+    }
+    $prevyear = $year;
+    $gasYearSum = 0;
+  }
+  my $tokenSymbol = "ETH";
+  my $tokenDecimal = 18;
+  if (exists $t->{tokenSymbol}) {
+    if (exists $token_label{lc($t->{contractAddress})}) {
+      my $tokl = $token_label{lc($t->{contractAddress})};
+      $tokenSymbol = $tokl->{symbol};
+      $tokenDecimal = $tokl->{decimal};
+    } elsif ($t->{tokenSymbol} ne "") {
+      $tokenSymbol = $t->{tokenSymbol};
+      $tokenDecimal = $t->{tokenDecimal} || 0;
+    } else {
+      $tokenSymbol = "-";
+      $tokenDecimal = 0;
+    }
+  }
+
+  my $type = "";
+  if ($t->{isError} || 0) {
+    $type = "ERR";
+  } elsif (!isOwnAddr($t->{from}) && isOwnAddr($t->{to})) {
+    addBalance($tokenSymbol, $tokenDecimal, $t->{value});
+    $type = "IN";
+  } elsif (isOwnAddr($t->{from}) && !isOwnAddr($t->{to})) {
+    addBalance($tokenSymbol, $tokenDecimal, -$t->{value});
+    $type = "OUT";
+  }
+
+  my $fee = ($t->{gasUsed} || 0) * ($t->{gasPrice} || 0);
+  if (isOwnAddr($t->{from})) {
+    $gasYearSum += $fee;
+    addBalance("ETH", 18, -$fee);
+  }
+
+  printf("%19s  %-42s -> %-42s %18.8f %-6s %12.8f ETH %-3s\n", strftime("%F %T", gmtime($t->{timeStamp})), addr($t->{from}), addr($t->{to}), $t->{value} / 10**$tokenDecimal, $tokenSymbol, $fee / 10**18, $type);
+}
+if ($prevyear > 0) {
+  printBalance(strftime("%F %T", gmtime()), time());
+}
+
