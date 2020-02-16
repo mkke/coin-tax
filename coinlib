@@ -15,6 +15,7 @@ my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax") or exit_error("$ENV{HOME
 
 my $ua = LWP::UserAgent->new;
 $ua->agent("coinlib cli/1.0");
+$ua->timeout(5);
 my $api = URI->new($config->{"Coinlib-Historical"}->{api}) or exit_error("api url not configured");
 
 my %q_params = ();

@@ -20,6 +20,7 @@ my @coins = split(/,/, $config->{Coinlib}->{coins}) or exit_error("coins not con
 my @currencies = split(/,/, $config->{Coinlib}->{currencies}) or exit_error("currencies not configured");
 
 my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
+$dbh->sqlite_busy_timeout(5_000);
 # numeric values are stored as TEXT to not loose precision
 $dbh->do("CREATE TABLE IF NOT EXISTS coins (symbol TEXT, currency TEXT, date DATETIME, show_symbol TEXT, name TEXT, rank INTEGER, price TEXT, market_cap TEXT, total_volume_24h TEXT, low_24h TEXT, high_24h TEXT, delta_1h TEXT, delta_24h TEXT, delta_7d TEXT, delta_30d TEXT, PRIMARY KEY (symbol, currency, date))") or exit_error("create table coins failed");
 $dbh->do("CREATE TABLE IF NOT EXISTS markets (coin_symbol TEXT, currency TEXT, date DATETIME, symbol TEXT, volume_24h TEXT, price TEXT, PRIMARY KEY (coin_symbol, currency, date, symbol), FOREIGN KEY (coin_symbol, currency, date) REFERENCES coins(symbol, currency, date))") or exit_error("create table markets failed");
@@ -40,6 +41,16 @@ my $api_key = $config->{Coinlib}->{api_key} or exit_error("api_key not configure
 
 my $curl = WWW::Curl::Easy->new;
 #$curl->setopt(CURLOPT_HEADER,1);
+$curl->setopt(CURLOPT_TIMEOUT, 30);
+$curl->setopt(CURLOPT_FOLLOWLOCATION, 1);
+$curl->setopt(CURLOPT_MAXREDIRS, 8);
+$curl->setopt(CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+$curl->setopt(CURLOPT_COOKIEFILE, "$ENV{HOME}/.coinlib-cookies");
+$curl->setopt(CURLOPT_COOKIEJAR, "$ENV{HOME}/.coinlib-cookies");
+
+# start an IMMEDIATE transaction, so that we aren't interrupted between issuing
+# the GET request and updating the counter...
+$dbh->begin_work() or exit_error("begin transaction failed");
 
 my $remaining = 180;
 my $time_since_last_success = undef;
@@ -60,7 +71,6 @@ if (!$quiet) {
   print "$remaining coin API calls remaining in current interval\n";
 }
 
-$dbh->begin_work();
 foreach my $currency (@currencies) {
   my @coinsLeft = @coins;
   
@@ -143,7 +153,7 @@ foreach my $currency (@currencies) {
     $remaining = $json_cl->{remaining};
     $insert_remaining->execute("coin", Date::Manip::Date->new('now')->printf("%O%z"), $remaining);
     if (@coinsLeft) {
-      sleep 1;
+      sleep 5;
     }
   }  
 }
@@ -161,6 +171,7 @@ sub exit_error {
 sub from_big_num {
   my $value = shift;
   if (defined $value) {
+    $value =~ s/,/./g;
     if (eval { $value->isa('Math::BigInt') } || eval { $value->isa('Math::BigFloat') }) {
       return $value->bdstr;
     } else {

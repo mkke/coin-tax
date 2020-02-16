@@ -9,16 +9,17 @@ use File::Basename;
 
 my $cgi = CGI->new;
 
-my $config = Config::Tiny->read("$ENV{HOME}/.coin-tax");
+my $home = $ENV{HOME} || "";
+my $config = Config::Tiny->read("${home}/.coin-tax");
 if (!defined $config) {
   my $dirname = dirname(__FILE__);
   $config = Config::Tiny->read("$dirname/.coin-tax");
 }
 if (!defined $config) {
-  exit_error("$ENV{HOME}/.coin-tax: not found");
+  exit_error("${home}/.coin-tax: not found");
 }
 my $dbname = $config->{Coinlib}->{db} or exit_error("db not configured");
-$dbname =~ s/~/$ENV{HOME}/;
+$dbname =~ s/~/${home}/;
 
 my $dbh = DBI->connect($dbname) or exit_error("$dbname: cannot connect");
 my $select_coin = $dbh->prepare("WITH c AS (SELECT * FROM coins WHERE symbol = ? AND currency = ?), dates AS (SELECT ? as sel_date) SELECT * FROM c WHERE date = (SELECT max(date) FROM c AS c2 WHERE c2.date <= (SELECT sel_date FROM dates) AND c2.date > (SELECT datetime(sel_date, '-6 hours') FROM dates))") or exit_error("select_coin prepare failed");
