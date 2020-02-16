@@ -153,8 +153,6 @@ foreach my $t (@$transactions) {
     my $lost = $vinTicket + $vinProfit - ($voutOwn + $voutStakepool);
     die "profit mismatch vinTicket = $vinTicket, vinProfit = $vinProfit, voutOwn = $voutOwn, voutStakepool = $voutStakepool" if ($lost < 0 || $lost > 1);
 
-    #my $blocksubsidy = parse_json("dcrctl getblocksubsidy $block->{height} $block->{voters}");
-    #my $pos_reward = (int($blocksubsidy->{pos}) / int($block->{voters}) - 1) / ATOMS_PER_DECRED; # value is off by one compared to blockexplorer, why? -> - 1
     my $pos_reward = $voutSum - $vinTicket;
 
     # locate ticket tx
@@ -211,9 +209,20 @@ foreach my $t (@$transactions) {
 if ($verbose) {
   print "-" x 114 . "\n";
 }
+
+# add the actual ticket fee of open tickets
+my $ticketfee = ($balances->{totalvotingauthority} - $balances->{totallockedbytickets});
+if ($ticketfee > 0) {
+  if ($verbose) {
+    printf("%-87s %12.8f  %12.8f\n", "ticket + voting pool fees of live/immature tickets", -$ticketfee, -$ticketfee);
+  }
+  $sum -= $ticketfee * ATOMS_PER_DECRED;
+  $balance -= $ticketfee * ATOMS_PER_DECRED;
+}
+
 if ($open_ticketfees != 0) {
   if ($verbose) {
-    printf("%-87s %12.8f  %12.8f\n", "fees payed for live/immature tickets", -$open_ticketfees, -$open_ticketfees);
+    printf("%-87s %12.8f  %12.8f\n", "transaction fees payed for buying live/immature tickets", -$open_ticketfees, -$open_ticketfees);
   }
   $sum -= $open_ticketfees * ATOMS_PER_DECRED;
   $balance -= $open_ticketfees * ATOMS_PER_DECRED;
